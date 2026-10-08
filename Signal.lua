@@ -4,6 +4,7 @@
 local Signal = {}
 Signal.__index = Signal
 local EventBus = require(script.Parent.EventBus)
+local MAX_HISTORY = 256
 
 function Signal.new()
 	local self = {}
@@ -12,6 +13,7 @@ function Signal.new()
 	self._history = {}
 	self._waiters = {}
 	self._destroyed = false
+	self._profileEnabled = false
 	return setmetatable(self, Signal)
 end
 
@@ -23,49 +25,73 @@ function Signal:Once(callback, priority)
 	return self._bus:SubscribeOnce(self._eventName, callback, priority)
 end
 
+local function recordAndWake(self, data)
+    if data ~= nil then
+        local history = self._history
+        history[#history + 1] = data
+        if #history > MAX_HISTORY then table.remove(history, 1) end
+    end
+    local waiters = self._waiters
+    self._waiters = {}
+    for _, thread in ipairs(waiters) do task.spawn(thread, data) end
+end
+
 function Signal:Fire(data)
-	if self._destroyed then return end
-	table.insert(self._history, data)
-	self._bus:Publish(self._eventName, data)
-	for _, waiter in ipairs(self._waiters) do
-		task.spawn(waiter, data)
-	end
-	table.clear(self._waiters)
+    if self._destroyed then return end
+    recordAndWake(self, data)
+    local startTime = if self._profileEnabled then os.clock() else 0
+    self._bus:Publish(self._eventName, data)
+    if self._profileEnabled then print("Signal dispatch seconds:", os.clock() - startTime) end
 end
 
 function Signal:FireAsync(data)
-	if self._destroyed then return end
-	table.insert(self._history, data)
-	return self._bus:PublishAsync(self._eventName, data)
+    if self._destroyed then return nil end
+    recordAndWake(self, data)
+    local startTime = if self._profileEnabled then os.clock() else 0
+    local promise = self._bus:PublishAsync(self._eventName, data)
+    if self._profileEnabled then
+        promise:finally(function()
+            print("Signal async dispatch seconds:", os.clock() - startTime)
+        end)
+    end
+    return promise
 end
 
 function Signal:Wait()
-	return coroutine.yield(function(resolve)
-		table.insert(self._waiters, resolve)
-	end)
+    assert(not self._destroyed, "SIGNAL_DESTROYED")
+    local thread = coroutine.running()
+    table.insert(self._waiters, thread)
+    return coroutine.yield()
 end
 
 function Signal:DisconnectAll()
-	self._bus:Destroy()
+    self._bus:Clear(self._eventName)
 end
 
 function Signal:Destroy()
-	self._destroyed = true
-	self._bus:Destroy()
-	self._history = {}
-	self._waiters = {}
+    if self._destroyed then return end
+    self._destroyed = true
+    if self._parentConnection then self._parentConnection:Disconnect() end
+    self._bus:Destroy()
+    self._history = {}
+    local waiters = self._waiters
+    self._waiters = {}
+    for _, thread in ipairs(waiters) do task.spawn(thread, nil) end
 end
 
 function Signal:Replay(n, callback)
-	local count = math.min(#self._history, n)
-	for i = 1, #self._history - count + 1, #self.history do
-		callback(self._history[i])
-	end
+    assert(type(callback) == "function", "Callback required")
+    assert(type(n) == "number" and n >= 0 and n % 1 == 0, "Invalid replay count")
+    local history = self._history
+    local count = math.min(#history, n)
+    for index = #history - count + 1, #history do
+        callback(history[index])
+    end
 end
 
 function Signal:Map(mapper)
 	local mapped = Signal.new()
-	self:Connect(function(data)
+	mapped._parentConnection = self:Connect(function(data)
 		mapped:Fire(mapper(data))
 	end)
 	return mapped
@@ -73,7 +99,7 @@ end
 
 function Signal:Filter(predicate)
 	local filtered = Signal.new()
-	self:Connect(function(data)
+	filtered._parentConnection = self:Connect(function(data)
 		if predicate(data) then
 			filtered:Fire(data)
 		end
@@ -119,13 +145,8 @@ function Signal:Trace(tag)
 end
 
 function Signal:Profile()
-	self:Connect(function(data)
-		local start = os.clock()
-		self._bus:PublishAsync(self._eventName, data)
-			:andThen(function()
-				print("Profile:", os.clock() - start)
-			end)
-	end)
+    -- Instrument real dispatch, never republish inside a listener.
+    self._profileEnabled = true
 end
 
 return Signal
