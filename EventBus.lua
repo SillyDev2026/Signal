@@ -1,131 +1,122 @@
---!native
+--!strict
 --!optimize 2
 
-local Signal = {}
-Signal.__index = Signal
-local EventBus = require(script.Parent.EventBus)
+-- Lightweight per-event listener registry. Callbacks are scheduled independently
+-- so yielding user handlers cannot stall a publisher.
+local EventBus = {}
+EventBus.__index = EventBus
 
-function Signal.new()
-	local self = {}
-	self._bus = EventBus.new()
-	self._eventName = 'SignalEvent'
-	self._history = {}
-	self._waiters = {}
-	self._destroyed = false
-	return setmetatable(self, Signal)
+export type Connection = {
+    Connected: boolean,
+    Disconnect: (self: Connection) -> (),
+}
+
+type Callback = (...any) -> ()
+type Listener = {callback: Callback, priority: number, order: number, once: boolean, connection: Connection}
+type Registry = {[string]: {Listener}}
+
+function EventBus.new()
+    return setmetatable({
+        _listeners = {} :: Registry,
+        _order = 0,
+        _destroyed = false,
+    }, EventBus)
 end
 
-function Signal:Connect(callback, priority)
-	return self._bus:Subscribe(self._eventName, callback, priority)
+function EventBus:_subscribe(eventName: string, callback: Callback, priority: number?, once: boolean): Connection
+    assert(not self._destroyed, "EventBus is destroyed")
+    assert(type(eventName) == "string" and eventName ~= "", "Event name must be a nonempty string")
+    assert(type(callback) == "function", "Listener must be a function")
+    local rank = priority or 0
+    assert(type(rank) == "number" and rank == rank and math.abs(rank) < math.huge, "Invalid listener priority")
+    self._order += 1
+    local bucket = self._listeners[eventName]
+    if bucket == nil then
+        bucket = {}
+        self._listeners[eventName] = bucket
+    end
+
+    local connection: Connection = {Connected = true, Disconnect = function() end}
+    local listener: Listener = {callback = callback, priority = rank, order = self._order, once = once, connection = connection}
+    function connection:Disconnect()
+        if not self.Connected then return end
+        self.Connected = false
+        local index = table.find(bucket, listener)
+        if index ~= nil then table.remove(bucket, index) end
+    end
+    table.insert(bucket, listener)
+    table.sort(bucket, function(a, b)
+        if a.priority == b.priority then return a.order < b.order end
+        return a.priority > b.priority
+    end)
+    return connection
 end
 
-function Signal:Once(callback, priority)
-	return self._bus:SubscribeOnce(self._eventName, callback, priority)
+function EventBus:Subscribe(eventName: string, callback: Callback, priority: number?): Connection
+    return self:_subscribe(eventName, callback, priority, false)
 end
 
-function Signal:Fire(data)
-	if self._destroyed then return end
-	table.insert(self._history, data)
-	self._bus:Publish(self._eventName, data)
-	for _, waiter in ipairs(self._waiters) do
-		task.spawn(waiter, data)
-	end
-	table.clear(self._waiters)
+function EventBus:SubscribeOnce(eventName: string, callback: Callback, priority: number?): Connection
+    return self:_subscribe(eventName, callback, priority, true)
 end
 
-function Signal:FireAsync(data)
-	if self._destroyed then return end
-	table.insert(self._history, data)
-	return self._bus:PublishAsync(self._eventName, data)
+function EventBus:_snapshot(eventName: string): {Listener}
+    if self._destroyed then return {} end
+    local bucket = self._listeners[eventName]
+    if bucket == nil then return {} end
+    local copy = table.clone(bucket)
+    for _, listener in ipairs(copy) do
+        if listener.once then listener.connection:Disconnect() end
+    end
+    return copy
 end
 
-function Signal:Wait()
-	return coroutine.yield(function(resolve)
-		table.insert(self._waiters, resolve)
-	end)
+local function invoke(listener: Listener, args: {any}, argc: number)
+    local ok, err = pcall(listener.callback, table.unpack(args, 1, argc))
+    if not ok then warn("[EventBus] subscriber failed:", err) end
 end
 
-function Signal:DisconnectAll()
-	self._bus:Destroy()
+function EventBus:Publish(eventName: string, ...): number
+    local listeners = self:_snapshot(eventName)
+    local args = table.pack(...)
+    for _, listener in ipairs(listeners) do
+        if listener.once or listener.connection.Connected then
+            task.spawn(invoke, listener, args, args.n)
+        end
+    end
+    return #listeners
 end
 
-function Signal:Destroy()
-	self._destroyed = true
-	self._bus:Destroy()
-	self._history = {}
-	self._waiters = {}
+function EventBus:PublishAsync(eventName: string, ...)
+    local Promise = require(script.Parent:WaitForChild("Promise"))
+    local listeners = self:_snapshot(eventName)
+    local args = table.pack(...)
+    return Promise.new(function(resolve: (number) -> ())
+        local remaining = #listeners
+        if remaining == 0 then resolve(0) return end
+        for _, listener in ipairs(listeners) do
+            task.spawn(function()
+                if listener.once or listener.connection.Connected then
+                    invoke(listener, args, args.n)
+                end
+                remaining -= 1
+                if remaining == 0 then resolve(#listeners) end
+            end)
+        end
+    end)
 end
 
-function Signal:Replay(n, callback)
-	local count = math.min(#self._history, n)
-	for i = 1, #self._history - count + 1, #self.history do
-		callback(self._history[i])
-	end
+function EventBus:Clear(eventName: string)
+    local bucket = self._listeners[eventName]
+    if bucket == nil then return end
+    for _, listener in ipairs(bucket) do listener.connection.Connected = false end
+    self._listeners[eventName] = nil
 end
 
-function Signal:Map(mapper)
-	local mapped = Signal.new()
-	self:Connect(function(data)
-		mapped:Fire(mapper(data))
-	end)
-	return mapped
+function EventBus:Destroy()
+    if self._destroyed then return end
+    self._destroyed = true
+    for name in pairs(self._listeners) do self:Clear(name) end
 end
 
-function Signal:Filter(predicate)
-	local filtered = Signal.new()
-	self:Connect(function(data)
-		if predicate(data) then
-			filtered:Fire(data)
-		end
-	end)
-	return filtered
-end
-
-function Signal:Pipe(targetSignal)
-	self:Connect(function(data)
-		targetSignal:Fire(data)
-	end)
-end
-
-function Signal:Throttle(seconds)
-	local throttled = Signal.new()
-	local last = 0
-	self:Connect(function(data)
-		local now = os.clock()
-		if now - last >= seconds then
-			last = now
-			throttled:Fire(data)
-		end
-	end)
-	return throttled
-end
-
-function Signal:Debounce(seconds)
-	local debounced = Signal.new()
-	local timer = nil
-	self:Connect(function(data)
-		if timer then task.cancel(timer) end
-		timer = task.delay(seconds, function()
-			debounced:Fire(data)
-		end)
-	end)
-	return debounced
-end
-
-function Signal:Trace(tag)
-	self:Connect(function(data)
-		print(`[Trace]: [{tag}]: {data}`)
-	end)
-end
-
-function Signal:Profile()
-	self:Connect(function(data)
-		local start = os.clock()
-		self._bus:PublishAsync(self._eventName, data)
-			:andThen(function()
-				print("Profile:", os.clock() - start)
-			end)
-	end)
-end
-
-return Signal
+return EventBus
