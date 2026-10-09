@@ -17,7 +17,7 @@ function Signal.new()
         _history = {} :: {any},
         _waiters = {} :: {thread},
         _upstreams = {} :: {Connection},
-        _timers = {} :: {thread},
+        _timers = {} :: {[thread]: boolean},
         _destroyed = false,
         _profile = false,
     }, Signal)
@@ -77,7 +77,7 @@ function Signal:Destroy()
     self._destroyed = true
     self._bus:Destroy()
     for _, connection in ipairs(self._upstreams) do connection:Disconnect() end
-    for _, timer in ipairs(self._timers) do pcall(task.cancel, timer) end
+    for timer in pairs(self._timers) do pcall(task.cancel, timer) end
     self:_wake(nil)
     table.clear(self._history)
     table.clear(self._upstreams)
@@ -130,12 +130,16 @@ function Signal:Debounce(seconds: number)
     local debounced = Signal.new()
     local pending: thread? = nil
     local connection = self:Connect(function(data)
-        if pending then pcall(task.cancel, pending) end
+        if pending then
+            debounced._timers[pending] = nil
+            pcall(task.cancel, pending)
+        end
         pending = task.delay(seconds, function()
+            if pending then debounced._timers[pending] = nil end
             pending = nil
             if not debounced._destroyed then debounced:Fire(data) end
         end)
-        table.insert(debounced._timers, pending)
+        debounced._timers[pending] = true
     end)
     table.insert(debounced._upstreams, connection)
     return debounced
