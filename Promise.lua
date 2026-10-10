@@ -13,7 +13,7 @@ local REJECTED = "REJECTED"
 local microtaskQueue = {}
 local microtaskRunning = false
 
-function flushMicrotasks()
+local function flushMicrotasks()
 	for _, promise in ipairs(microtaskQueue) do
 		promise:_flushCallbacks()
 	end
@@ -21,7 +21,7 @@ function flushMicrotasks()
 	microtaskRunning = false
 end
 
-function scheduleMicrotask(promise)
+local function scheduleMicrotask(promise)
 	table.insert(microtaskQueue, promise)
 	if not microtaskRunning then
 		microtaskRunning = true
@@ -91,6 +91,10 @@ function Promise:_flushCallbacks()
 			else
 				if cb.reject then cb.reject(result) end
 			end
+		elseif self._state == FULFILLED then
+			if cb.resolve then cb.resolve(self._value) end
+		elseif self._state == REJECTED then
+			if cb.reject then cb.reject(self._value) end
 		end
 	end
 end
@@ -168,11 +172,15 @@ function Promise:await()
 		error(self._value)
 	end
 
-	return coroutine.yield(function(resolve)
-		self:andThen(resolve, function(err)
-			error(err)
-		end)
+	local waiting = coroutine.running()
+	self:andThen(function(value)
+		task.spawn(waiting, true, value)
+	end, function(err)
+		task.spawn(waiting, false, err)
 	end)
+	local ok, result = coroutine.yield()
+	if not ok then error(result, 2) end
+	return result
 end
 
 function Promise.resolve(value)
@@ -238,7 +246,7 @@ function Promise.timeOut(promise, seconds)
 	end)
 end
 
-function retryHelper(executor, remaining, delaySeconds, resolve, reject)
+local function retryHelper(executor, remaining, delaySeconds, resolve, reject)
 	Promise.new(executor)
 		:andThen(resolve)
 		:catch(function(err)
