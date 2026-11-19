@@ -40,6 +40,31 @@ task.wait(0.03)
 assert(received == 14, "Map did not forward events")
 mapped:Destroy()
 
+-- A cancelled Wait coroutine must not abort future Signal:Fire dispatch.
+local cancelledSignal = Signal.new()
+local cancelledWaiter = task.spawn(function() cancelledSignal:Wait() end)
+task.wait()
+task.cancel(cancelledWaiter)
+local stillDispatched = false
+cancelledSignal:Connect(function() stillDispatched = true end)
+cancelledSignal:Fire(1)
+task.wait(0.03)
+assert(stillDispatched, "Cancelled Wait coroutine interrupted event dispatch")
+cancelledSignal:Destroy()
+
+-- Debounce must emit only the latest event and not retain completed timers.
+local source = Signal.new()
+local debounced = source:Debounce(0.02)
+local debouncedValues = {}
+debounced:Connect(function(value) table.insert(debouncedValues, value) end)
+source:Fire("old")
+source:Fire("new")
+task.wait(0.07)
+assert(#debouncedValues == 1 and debouncedValues[1] == "new", "Debounce emitted stale or duplicate values")
+assert(next(debounced._timers) == nil, "Completed debounce timer was retained")
+debounced:Destroy()
+source:Destroy()
+
 local passedThrough = false
 Promise.new(function(resolve)
     task.defer(resolve, 41)
