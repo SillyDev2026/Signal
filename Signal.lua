@@ -42,7 +42,9 @@ end
 function Signal:_wake(data: any)
     local waiters = self._waiters
     self._waiters = {}
-    for _, waiting in ipairs(waiters) do task.spawn(waiting, data) end
+    for _, waiting in ipairs(waiters) do
+        if coroutine.status(waiting) == "suspended" then task.spawn(waiting, data) end
+    end
 end
 
 function Signal:Fire(data: any)
@@ -129,17 +131,23 @@ function Signal:Debounce(seconds: number)
     assert(seconds >= 0 and seconds < math.huge, "seconds must be finite and nonnegative")
     local debounced = Signal.new()
     local pending: thread? = nil
+    local generation = 0
     local connection = self:Connect(function(data)
+        generation += 1
+        local currentGeneration = generation
         if pending then
             debounced._timers[pending] = nil
             pcall(task.cancel, pending)
         end
-        pending = task.delay(seconds, function()
-            if pending then debounced._timers[pending] = nil end
+        local timer: thread
+        timer = task.delay(seconds, function()
+            debounced._timers[timer] = nil
+            if currentGeneration ~= generation or debounced._destroyed then return end
             pending = nil
-            if not debounced._destroyed then debounced:Fire(data) end
+            debounced:Fire(data)
         end)
-        debounced._timers[pending] = true
+        pending = timer
+        debounced._timers[timer] = true
     end)
     table.insert(debounced._upstreams, connection)
     return debounced
